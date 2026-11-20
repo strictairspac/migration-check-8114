@@ -8,6 +8,8 @@ class Run(Base):
  mapping_id=Column(Integer,ForeignKey('mappings.id'),nullable=False)
  status=Column(String(20),nullable=False,default='queued')
  cancel_requested=Column(Boolean,nullable=False,default=False)
+ # Shared billing/close clock value captured when this run was submitted.
+ submit_seq=Column(Integer,nullable=False,default=0,index=True)
  snapshot=Column(JSON,nullable=False)
  progress=Column(JSON,nullable=True)
  result=Column(JSON,nullable=True)

@@ -8,6 +8,8 @@ from src.models.mapping import Mapping
 from src.models.run import Run,TargetRow
 from src.utils.serialization import record
 from src.services.migration import digest,key_digest,validate_backup
+from src.services.billing import submit_seq,register_restored
+from src.models.billing import BillingLine
 queue=redis.Redis.from_url(REDIS_URL)
 def list_items():
  with Session() as s:return [record(r) for r in s.query(Run).order_by(Run.id.desc()).limit(100).all()]
@@ -22,7 +24,11 @@ def create(data):
   if not m:raise HTTPException(404,'未找到字段映射')
   b=s.get(Batch,m.batch_id)
   r=Run(name=data.name,batch_id=b.id,mapping_id=m.id,status='queued',snapshot={'batch':record(b),'mapping':record(m)})
-  s.add(r);s.commit();s.refresh(r);result=record(r)
+  s.add(r);s.flush()
+  # Take the shared close/submit clock inside the same transaction. The control
+  # row lock is held until commit, so a concurrent close cannot interleave.
+  r.submit_seq=submit_seq(s)
+  s.commit();s.refresh(r);result=record(r)
  try:queue.rpush('migration-runs',result['id'])
  except redis.RedisError:
   with Session() as s:r=s.get(Run,result['id']);r.status='failed';r.error='队列不可用，请创建新任务';s.commit()
@@ -58,4 +64,13 @@ def restore(item_id,data):
   actual=[x.payload for x in s.query(TargetRow).filter_by(run_id=item_id).order_by(TargetRow.ordinal)]
   proof={'restored_at':datetime.now(timezone.utc).isoformat(),'previous_count':before,'restored_count':len(actual),'checksum':digest(actual),'verified':digest(actual)==r.result['checksum']}
   if not proof['verified']:raise HTTPException(409,'恢复后校验失败，已回滚')
+  # Restoring rewrites existing target rows for this run; the billing ledger is
+  # untouched. A completed run was already billed at first ingestion, so a
+  # restore (including a retried restore after a lost receipt) never adds a line.
+  # Only a missing first-ingestion record is filled, and only when this run has
+  # no ledger line yet (a database from before the billing feature existed).
+  billed=s.query(BillingLine).filter_by(run_id=item_id).count()
+  registered=0
+  if billed==0:registered=register_restored(s,r,(r.snapshot or {}).get('batch',{}).get('name',''),rows)
+  proof['billing']={'billed_lines':billed,'registered_ingestions':registered,'charged_this_restore':0,'note':'恢复备份不重复计费'}
   r.recovery=(r.recovery or [])+[proof];s.commit();return proof
